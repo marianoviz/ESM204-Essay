@@ -1,0 +1,221 @@
+---
+title: "ESM 204 Essay"
+author: "Mariano Viz"
+date: "03/06/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(janitor)
+library(here)
+
+```
+
+
+```{r}
+#read in data
+oecd_fao <- read_csv(here("data", "HIGH_AGLINK_2020_03062021231005902.csv"))
+elasticity <- read_csv(here("data", "elasticity.csv")) %>% 
+  clean_names()
+emissions <- read_csv(here("data", "food-emissions-supply-chain.csv")) %>% 
+  clean_names()
+scc <- read_csv(here("data", "SCC.csv")) %>% 
+  clean_names()
+
+```
+
+
+
+```{r}
+#tidy oecd_fao
+fao_selected <- oecd_fao %>% 
+  select("Commodity", "Variable", "Time", "Unit", "PowerCode", "Value") %>% 
+  clean_names() %>% 
+  filter(commodity != "Sheepmeat") #exclude sheepmeat (10 fold lower than other commodities)
+
+
+fao_cons <- fao_selected %>% 
+  filter(variable == "Consumption") %>% 
+  filter(commodity != "Fish from capture") %>% 
+  filter(commodity != "Fish from aquaculture")
+fao_cons$value_tonnes <- fao_cons$value*1000
+fao_consumption <- fao_cons %>% 
+   pivot_wider(names_from = "variable",
+               values_from = "value_tonnes") %>% 
+  clean_names() %>% 
+  rename(consumption_tonne = consumption) %>% 
+  rename(year = time) %>% 
+  select("commodity", "year", "consumption_tonne")
+
+fao_price <- fao_selected %>% 
+  filter(variable == "Producer price") %>% 
+  filter(commodity != "Fish from capture") %>% 
+  filter(commodity != "Fish from aquaculture") %>% 
+  pivot_wider(names_from = "variable",
+               values_from = "value") %>% 
+  clean_names() %>% 
+  rename(prod_price_usd_per_tonne = producer_price) %>% 
+  rename(year = time) %>% 
+  select("commodity", "year", "prod_price_usd_per_tonne")
+
+fao <- fao_consumption %>% 
+  full_join(fao_price, by = c("commodity", "year"))
+
+#add producer price x2 as a closer value to consumer price:
+fao$cons_price_usd_per_kg <- fao$prod_price_usd_per_tonne*2/1000
+
+#add consumption in kg:
+fao$consumption_kg <- fao$consumption_tonne*1000
+
+```
+
+
+
+```{r}
+#plots
+ggplot(data = fao_consumption, aes(x = year, y = consumption_tonne)) +
+  geom_col(aes(fill=commodity)) +
+  facet_wrap(~commodity, scales = "free")+
+  scale_x_continuous(breaks=c(2020, 2023, 2026, 2029))+
+  theme_minimal()
+ggplot(data = fao_consumption, aes(x = year, y = consumption_tonne)) +
+  geom_col(aes(fill=commodity)) +
+  scale_x_continuous(breaks=c(2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028, 2029))+
+  theme_minimal()
+
+
+ggplot(data = fao_price, aes(x = year, y = prod_price_usd_per_tonne)) +
+  geom_col(aes(fill=commodity)) +
+  scale_x_continuous(breaks=c(2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028, 2029))+
+  theme_minimal()
+```
+
+```{r}
+#add price elasticity of demand (absolute value):
+elast_selected <- elasticity %>% 
+  filter(food_type %in% c("Beef", "Pork", "Poultry", "Fish"))
+
+elasticity <- function(commodity) {
+  if (commodity == "Beef and veal") 
+    return(0.75)
+  if (commodity == "Pigmeat") 
+    return(0.72)
+  if (commodity == "Poultry meat") 
+    return(0.68)
+  if (commodity == "Fish") 
+    return(0.50)
+}
+
+
+for(i in 1:nrow(fao)) {
+   fao$elasticity[i] = elasticity(fao$commodity[i])
+}
+
+```
+
+
+
+```{r}
+#emissions (kg co2 eq per kg of food):
+emi_selected <- emissions %>% 
+  filter(entity %in% c("Beef (beef herd)", "Pig Meat", "Poultry Meat", "Fish (farmed)")) %>% #don't know why fish (wildcatch) is in the website but not in the dataset
+  select(!c("code", "year", "food_emissions_land_use"))
+
+emi_selected$kg_co2_eq <- rowSums(emi_selected[2:7])
+
+#SCC (usd/metric ton): 
+#add scc per kg of co2:
+scc$discount_rate_5_percent_kg <- scc$discount_rate_5_percent/1000
+scc$discount_rate_3_percent_kg <- scc$discount_rate_3_percent/1000
+scc$discount_rate_2_5_percent_kg <- scc$discount_rate_2_5_percent/1000
+#For simplicity lets use 2025 as a proxy of 2020-2029 valuation:
+scc_2025 <- scc %>% 
+  filter(year == 2025)
+
+#Df of scc, emission, tax:
+ghg_tax <- emi_selected %>% 
+  select("entity", "kg_co2_eq") %>% 
+  rename(commodity = entity)
+ghg_tax[2,1] <- "Fish"
+ghg_tax[2,2] <- 4  #change name and value to account for fish (wild catch): ghg=3
+ghg_tax$scc_kg_r5 <- 0.017
+ghg_tax$scc_kg_r3 <- 0.056
+ghg_tax$scc_kg_r2_5 <- 0.083
+
+ghg_tax$tax_kg_scc5 <- ghg_tax$kg_co2_eq*ghg_tax$scc_kg_r5
+ghg_tax$tax_kg_scc3 <- ghg_tax$kg_co2_eq*ghg_tax$scc_kg_r3
+ghg_tax$tax_kg_scc2_5 <- ghg_tax$kg_co2_eq*ghg_tax$scc_kg_r2_5
+
+```
+
+
+```{r}
+#add tax
+tax_kg_r5 <- function(commodity) {
+  if (commodity == "Beef and veal") 
+    return(0.7361)
+  if (commodity == "Pigmeat") 
+    return(0.0969)
+  if (commodity == "Poultry meat") 
+    return(0.0612)
+  if (commodity == "Fish") 
+    return(0.0680)
+}
+tax_kg_r3 <- function(commodity) {
+  if (commodity == "Beef and veal") 
+    return(2.4248)
+  if (commodity == "Pigmeat") 
+    return(0.3192)
+  if (commodity == "Poultry meat") 
+    return(0.2016)
+  if (commodity == "Fish") 
+    return(0.2240)
+}
+tax_kg_r2_5 <- function(commodity) {
+  if (commodity == "Beef and veal") 
+    return(3.5939)
+  if (commodity == "Pigmeat") 
+    return(0.4731)
+  if (commodity == "Poultry meat") 
+    return(0.2988)
+  if (commodity == "Fish") 
+    return(0.3320)
+}
+
+
+for(i in 1:nrow(fao)) {
+   fao$tax_kg_r5[i] = tax_kg_r5(fao$commodity[i])
+}
+
+for(i in 1:nrow(fao)) {
+   fao$tax_kg_r3[i] = tax_kg_r3(fao$commodity[i])
+}
+
+for(i in 1:nrow(fao)) {
+   fao$tax_kg_r2_5[i] = tax_kg_r2_5(fao$commodity[i])
+}
+
+fao$cons_price_kg_plus_tax5 <- fao$cons_price_usd_per_kg+fao$tax_kg_r5
+fao$cons_price_kg_plus_tax3 <- fao$cons_price_usd_per_kg+fao$tax_kg_r3
+fao$cons_price_kg_plus_tax_5 <- fao$cons_price_usd_per_kg+fao$tax_kg_r2_5
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
